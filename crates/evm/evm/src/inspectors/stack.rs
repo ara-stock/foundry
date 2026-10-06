@@ -8,7 +8,9 @@ use alloy_primitives::{
     map::{AddressHashMap, AddressHashSet, AddressMap},
 };
 
-use foundry_cheatcodes::{CheatcodeAnalysis, CheatcodesExecutor, NestedEvmClosureFor, Wallets};
+use foundry_cheatcodes::{
+    CheatcodeAnalysis, CheatcodesExecutor, FreshNestedEvmClosureFor, NestedEvmClosureFor, Wallets,
+};
 use foundry_common::{compile::Analysis, sh_warn};
 use foundry_config::FuzzCorpusConfig;
 use foundry_evm_core::{
@@ -538,26 +540,63 @@ impl<FEN: FoundryEvmNetwork> CheatcodesExecutor<FEN> for InspectorStackInner {
     fn with_fresh_nested_evm(
         &mut self,
         cheats: &mut Cheatcodes<FEN>,
-        db: &mut <FoundryContextFor<'_, FEN> as ContextTr>::Db,
-        mut evm_env: EvmEnvFor<FEN>,
+        ecx: &mut FoundryContextFor<'_, FEN>,
         chain_context: ChainFor<FEN>,
-        f: NestedEvmClosureFor<'_, FEN>,
-    ) -> Result<EvmEnvFor<FEN>, EVMError<DatabaseError>> {
+        f: FreshNestedEvmClosureFor<'_, FEN>,
+    ) -> eyre::Result<EvmEnvFor<FEN>> {
+        let mut evm_env = ecx.evm_clone();
         let inherited_disable_fee_charge = evm_env.cfg_env.disable_fee_charge;
         if let Some(disable_fee_charge) = self.outer_disable_fee_charge {
             evm_env.cfg_env.disable_fee_charge = disable_fee_charge;
         }
-        let mut inspector = InspectorStackRefMut { cheatcodes: Some(cheats), inner: self };
-        let mut evm = FEN::EvmFactory::default().create_nested_evm_with_inspector(
-            db,
-            evm_env,
-            &mut inspector,
-        );
-        *evm.chain_mut() = chain_context;
-        f(&mut *evm)?;
-        let mut evm_env = evm.to_evm_env();
-        evm_env.cfg_env.disable_fee_charge = inherited_disable_fee_charge;
-        Ok(evm_env)
+        let root_depth = ecx.journal().depth();
+        let tracer_checkpoint = self.tracer.clone();
+        let fuzzer_checkpoint = self.fuzzer.clone();
+        let revert_diag_checkpoint = self.revert_diag.clone();
+        let locally_created_accounts = self.locally_created_accounts.clone();
+        let reverter = self.reverter;
+        let pending_call_traces = self.pending_call_traces.len();
+        let pending_create2_redirects = self.pending_create2_redirects.len();
+        let isolated_frame_checkpoints = self.isolated_frame_checkpoints.len();
+        let previous_inner_context = std::mem::replace(&mut self.in_inner_context, true);
+        let previous_inner_context_data = self.inner_context_data.replace(InnerContextData {
+            original_origin: ecx.tx().caller(),
+            locally_created_accounts: AddressHashSet::default(),
+            root_depth,
+        });
+        let previous_precompile = self.isolated_call_was_precompile.take();
+        let result = {
+            let mut inspector = InspectorStackRefMut { cheatcodes: Some(cheats), inner: self };
+            let mut evm = FEN::EvmFactory::default().create_nested_evm_with_inspector(
+                ecx.db_mut(),
+                evm_env,
+                &mut inspector,
+            );
+            *evm.chain_mut() = chain_context;
+            // The fresh transaction shares the tracer with the suspended parent.
+            evm.journal_inner_mut().depth = root_depth;
+            f(&mut *evm).map(|()| {
+                let mut evm_env = evm.to_evm_env();
+                evm_env.cfg_env.disable_fee_charge = inherited_disable_fee_charge;
+                evm_env
+            })
+        };
+        self.in_inner_context = previous_inner_context;
+        self.inner_context_data = previous_inner_context_data;
+        self.isolated_call_was_precompile = previous_precompile;
+        if result.is_err() {
+            // revm can abort on a host error without sending end callbacks for every active frame.
+            // Restore frame-sensitive inspectors so the enclosing execution can continue.
+            self.tracer = tracer_checkpoint;
+            self.fuzzer = fuzzer_checkpoint;
+            self.revert_diag = revert_diag_checkpoint;
+            self.locally_created_accounts = locally_created_accounts;
+            self.reverter = reverter;
+            self.pending_call_traces.truncate(pending_call_traces);
+            self.pending_create2_redirects.truncate(pending_create2_redirects);
+            self.isolated_frame_checkpoints.truncate(isolated_frame_checkpoints);
+        }
+        result
     }
 
     fn transact_on_db(
@@ -600,15 +639,6 @@ impl<FEN: FoundryEvmNetwork> CheatcodesExecutor<FEN> for InspectorStackInner {
 
     fn tracing_inspector(&mut self) -> Option<&mut TracingInspector> {
         self.tracer.as_deref_mut()
-    }
-
-    fn set_in_inner_context(&mut self, enabled: bool, original_origin: Option<Address>) {
-        self.in_inner_context = enabled;
-        self.inner_context_data = enabled.then(|| InnerContextData {
-            original_origin: original_origin.expect("origin required when enabling inner ctx"),
-            locally_created_accounts: AddressHashSet::default(),
-            root_depth: 1,
-        });
     }
 }
 
@@ -2384,11 +2414,13 @@ fn compute_batch_create_salt(process_salt: u64, chain_id: u64, nonce: u64, count
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Address, Fuzzer, InspectorStack, InspectorStackInner, OpcodeStepDispatch, RevertDiagnostic,
-        TraceRequirements, compute_batch_create_salt,
+    use super::*;
+    use foundry_evm_core::backend::Backend;
+    use revm::{
+        bytecode::Bytecode,
+        interpreter::{CallInput, CallValue},
+        state::AccountInfo,
     };
-    use foundry_evm_core::evm::EthEvmNetwork;
 
     #[test]
     fn opcode_dispatch_defaults_to_no_static_inspectors() {
@@ -2510,5 +2542,122 @@ mod tests {
         let addr_a = factory.create2_from_code(salt_a, init_code);
         let addr_b = factory.create2_from_code(salt_b, init_code);
         assert_ne!(addr_a, addr_b);
+    }
+
+    #[test]
+    fn fresh_nested_execution_restores_inspector_context_on_error() {
+        let mut backend = Backend::<EthEvmNetwork>::spawn(None).unwrap();
+        let target = Address::with_last_byte(0xa0);
+        let callee = Address::with_last_byte(0xb0);
+        let mut code = vec![op::PUSH0; 3];
+        code.extend_from_slice(&[op::CREATE, op::POP]);
+        code.extend_from_slice(&[op::PUSH0; 5]);
+        code.push(op::PUSH20);
+        code.extend_from_slice(callee.as_slice());
+        code.extend_from_slice(&[op::GAS, op::CALL, op::POP, op::STOP]);
+        backend.insert_account_info(
+            target,
+            AccountInfo::default().with_code(Bytecode::new_raw(code.into())),
+        );
+        backend.insert_account_info(
+            callee,
+            AccountInfo::default().with_code(Bytecode::new_raw(Bytes::from_static(&[
+                op::PUSH0,
+                op::PUSH0,
+                op::REVERT,
+            ]))),
+        );
+        let mut ecx = EvmFactoryFor::<EthEvmNetwork>::default().create_foundry_evm_with_inspector(
+            &mut backend,
+            EvmEnvFor::<EthEvmNetwork>::default(),
+            InspectorStack::<EthEvmNetwork>::new(),
+        );
+        ecx.db_journal_inner_mut().1.depth = 3;
+        let mut cheats = Cheatcodes::<EthEvmNetwork>::new(Arc::new(CheatsConfig::default()));
+        let mut tracer = TracingInspector::default();
+        for depth in 0..=3 {
+            ecx.db_journal_inner_mut().1.depth = depth;
+            tracer.call(&mut *ecx, &mut test_call_inputs(Address::with_last_byte(depth as u8)));
+        }
+
+        for in_inner_context in [false, true] {
+            ecx.db_journal_inner_mut().1.depth = 3;
+            let mut inner = InspectorStackInner {
+                tracer: Some(Box::new(tracer.clone())),
+                revert_diag: Some(Box::default()),
+                in_inner_context,
+                inner_context_data: in_inner_context.then(|| InnerContextData {
+                    original_origin: Address::with_last_byte(1),
+                    locally_created_accounts: [Address::with_last_byte(2)].into_iter().collect(),
+                    root_depth: 1,
+                }),
+                locally_created_accounts: [Address::with_last_byte(3)].into_iter().collect(),
+                isolated_call_was_precompile: Some(true),
+                ..Default::default()
+            };
+
+            let result = CheatcodesExecutor::<EthEvmNetwork>::with_fresh_nested_evm(
+                &mut inner,
+                &mut cheats,
+                &mut ecx,
+                (),
+                &mut |evm| {
+                    assert_eq!(evm.journal_inner_mut().depth, 3);
+                    let mut tx = TxEnvFor::<EthEvmNetwork>::default();
+                    tx.set_caller(Address::with_last_byte(0xc0));
+                    tx.set_kind(TxKind::Call(target));
+                    tx.set_gas_limit(100_000);
+                    tx.set_gas_price(0);
+                    evm.transact_raw(tx)?;
+                    Err(eyre::eyre!("nested execution failed"))
+                },
+            );
+            assert_eq!(result.unwrap_err().to_string(), "nested execution failed");
+            assert_eq!(inner.tracer.as_ref().unwrap().traces(), tracer.traces());
+
+            ecx.db_journal_inner_mut().1.depth = 4;
+            inner
+                .tracer
+                .as_mut()
+                .unwrap()
+                .call(&mut *ecx, &mut test_call_inputs(Address::with_last_byte(6)));
+            let nodes = inner.tracer.as_ref().unwrap().traces().nodes();
+            assert_eq!(nodes.last().unwrap().parent, Some(3));
+            assert_eq!(
+                inner.locally_created_accounts,
+                [Address::with_last_byte(3)].into_iter().collect()
+            );
+            assert!(inner.reverter.is_none());
+            assert_eq!(inner.in_inner_context, in_inner_context);
+            assert_eq!(inner.isolated_call_was_precompile, Some(true));
+            if in_inner_context {
+                let context = inner.inner_context_data.unwrap();
+                assert_eq!(context.original_origin, Address::with_last_byte(1));
+                assert_eq!(context.root_depth, 1);
+                assert_eq!(
+                    context.locally_created_accounts,
+                    [Address::with_last_byte(2)].into_iter().collect()
+                );
+            } else {
+                assert!(inner.inner_context_data.is_none());
+            }
+        }
+    }
+
+    fn test_call_inputs(address: Address) -> CallInputs {
+        CallInputs {
+            input: CallInput::Bytes(Bytes::new()),
+            return_memory_offset: 0..0,
+            gas_limit: 100_000,
+            reservoir: 0,
+            bytecode_address: address,
+            known_bytecode: (KECCAK_EMPTY, Bytecode::new_raw(Bytes::from_static(&[op::STOP]))),
+            target_address: address,
+            caller: Address::ZERO,
+            value: CallValue::default(),
+            scheme: CallScheme::Call,
+            is_static: false,
+            charged_new_account_state_gas: false,
+        }
     }
 }

@@ -251,8 +251,22 @@ pub type NestedEvmClosure<'a, F> = &'a mut dyn for<'j> FnMut(
 )
     -> Result<(), EVMError<DatabaseError>>;
 
+/// Closure type used by nested EVM operations that can return provider and host errors.
+pub type FreshNestedEvmClosure<'a, F> = &'a mut dyn for<'j> FnMut(
+    &mut dyn NestedEvm<
+        Spec = <F as EvmFactory>::Spec,
+        Block = <F as EvmFactory>::BlockEnv,
+        Tx = <F as EvmFactory>::Tx,
+        Chain = <F as FoundryEvmFactory>::Chain,
+        Journal = <<F as FoundryEvmFactory>::FoundryContext<'j> as ContextTr>::Journal,
+    >,
+) -> eyre::Result<()>;
+
 /// Nested EVM closure for a Foundry EVM network.
 pub type NestedEvmClosureFor<'a, FEN> = NestedEvmClosure<'a, EvmFactoryFor<FEN>>;
+
+/// Fresh nested EVM closure for a Foundry EVM network.
+pub type FreshNestedEvmClosureFor<'a, FEN> = FreshNestedEvmClosure<'a, EvmFactoryFor<FEN>>;
 
 /// Runs a child operation with the parent's environment, journal, and native chain state.
 ///

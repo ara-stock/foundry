@@ -44,8 +44,8 @@ use foundry_evm_core::{
     env::FoundryContextExt,
     evm::{
         BlockEnvFor, ChainFor, EthEvmNetwork, EvmFactoryFor, FoundryContextFor, FoundryEvmFactory,
-        FoundryEvmNetwork, NestedEvmClosureFor, SpecFor, TransactionRequestFor, TxEnvFor,
-        with_inherited_evm,
+        FoundryEvmNetwork, FreshNestedEvmClosureFor, NestedEvmClosureFor, SpecFor,
+        TransactionRequestFor, TxEnvFor, with_inherited_evm,
     },
 };
 use foundry_evm_traces::{
@@ -115,19 +115,19 @@ pub trait CheatcodesExecutor<FEN: FoundryEvmNetwork> {
         tx: TxEnvFor<FEN>,
     ) -> eyre::Result<()>;
 
-    /// Runs a closure with a fresh nested EVM built from a raw database and environment.
-    /// Unlike `with_nested_evm`, this does NOT clone from `ecx` and does NOT write back.
+    /// Runs a closure with a fresh nested EVM using the current database and environment.
+    /// Unlike `with_nested_evm`, this does not inherit the current journal or write back.
+    /// Inspector context and trace depth are scoped to the nested execution.
     /// The caller is responsible for state merging. Used by `executeTransactionCall`.
     /// Returns the final EVM environment after the closure runs (consumed without cloning).
     #[allow(clippy::type_complexity)]
     fn with_fresh_nested_evm(
         &mut self,
         cheats: &mut Cheatcodes<FEN>,
-        db: &mut <FoundryContextFor<'_, FEN> as ContextTr>::Db,
-        evm_env: EvmEnv<SpecFor<FEN>, BlockEnvFor<FEN>>,
+        ecx: &mut FoundryContextFor<'_, FEN>,
         chain_context: ChainFor<FEN>,
-        f: NestedEvmClosureFor<'_, FEN>,
-    ) -> Result<EvmEnv<SpecFor<FEN>, BlockEnvFor<FEN>>, EVMError<DatabaseError>>;
+        f: FreshNestedEvmClosureFor<'_, FEN>,
+    ) -> eyre::Result<EvmEnv<SpecFor<FEN>, BlockEnvFor<FEN>>>;
 
     /// Simulates `console.log` invocation.
     fn console_log(&mut self, msg: &str);
@@ -136,11 +136,6 @@ pub trait CheatcodesExecutor<FEN: FoundryEvmNetwork> {
     fn tracing_inspector(&mut self) -> Option<&mut TracingInspector> {
         None
     }
-
-    /// Marks that the next EVM frame is an "inner context" so that isolation mode does not
-    /// trigger a nested `transact_inner`. `original_origin` is stored for the existing
-    /// inner-context adjustment logic that restores `tx.origin`.
-    fn set_in_inner_context(&mut self, _enabled: bool, _original_origin: Option<Address>) {}
 }
 
 /// Builds a sub-EVM from the current context and executes the given CREATE frame.
@@ -192,14 +187,19 @@ impl<FEN: FoundryEvmNetwork> CheatcodesExecutor<FEN> for TransparentCheatcodesEx
     fn with_fresh_nested_evm(
         &mut self,
         cheats: &mut Cheatcodes<FEN>,
-        db: &mut <FoundryContextFor<'_, FEN> as ContextTr>::Db,
-        evm_env: EvmEnv<SpecFor<FEN>, BlockEnvFor<FEN>>,
+        ecx: &mut FoundryContextFor<'_, FEN>,
         chain_context: ChainFor<FEN>,
-        f: NestedEvmClosureFor<'_, FEN>,
-    ) -> Result<EvmEnv<SpecFor<FEN>, BlockEnvFor<FEN>>, EVMError<DatabaseError>> {
-        let mut evm =
-            FEN::EvmFactory::default().create_nested_evm_with_inspector(db, evm_env, cheats);
+        f: FreshNestedEvmClosureFor<'_, FEN>,
+    ) -> eyre::Result<EvmEnv<SpecFor<FEN>, BlockEnvFor<FEN>>> {
+        let evm_env = ecx.evm_clone();
+        let depth = ecx.journal().depth();
+        let mut evm = FEN::EvmFactory::default().create_nested_evm_with_inspector(
+            ecx.db_mut(),
+            evm_env,
+            cheats,
+        );
         *evm.chain_mut() = chain_context;
+        evm.journal_inner_mut().depth = depth;
         f(&mut *evm)?;
         Ok(evm.to_evm_env())
     }

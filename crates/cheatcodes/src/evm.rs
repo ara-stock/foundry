@@ -1399,13 +1399,7 @@ impl Cheatcode for executeTransactionCall {
         // lets the nested EVM enforce the real network limit for realistic simulation.
         ccx.ecx.cfg_env_mut().tx_gas_limit_cap = None;
 
-        // Snapshot the modified env for EVM construction.
-        let modified_evm_env = ccx.ecx.evm_clone();
         let modified_tx_env = ccx.ecx.tx_clone();
-
-        // Mark as inner context so isolation mode doesn't trigger a nested transact_inner
-        // when the inner EVM executes calls at depth == 1.
-        executor.set_in_inner_context(true, Some(sender));
         if let Some(address) = created_address {
             let fork_id = ccx.active_fork_id();
             ccx.state.record_created_account(fork_id, address);
@@ -1421,25 +1415,23 @@ impl Cheatcode for executeTransactionCall {
         let mut res = None;
         let mut cold_state = Some(cold_state);
         let nested_evm_env = {
-            let (db, _) = ccx.ecx.db_journal_inner_mut();
-            executor.with_fresh_nested_evm(
-                ccx.state,
-                db,
-                modified_evm_env,
-                chain_context,
-                &mut |evm| {
-                    // SAFETY: closure is called exactly once by the executor.
-                    evm.journal_inner_mut().state = cold_state.take().expect("called once");
-                    // Set depth to 1 for proper trace collection.
-                    evm.journal_inner_mut().depth = 1;
-                    res = Some(evm.transact_raw(modified_tx_env.clone()));
-                    Ok(())
-                },
-            )
+            executor.with_fresh_nested_evm(ccx.state, ccx.ecx, chain_context, &mut |evm| {
+                // SAFETY: closure is called exactly once by the executor.
+                evm.journal_inner_mut().state = cold_state.take().expect("called once");
+                res = Some(evm.transact_raw(modified_tx_env.clone())?);
+                Ok(())
+            })
         };
         ccx.state.track_isolated_snapshots = track_isolated_snapshots;
-        let mut nested_evm_env = nested_evm_env?;
-        let res = res.unwrap();
+        let mut nested_evm_env = match nested_evm_env {
+            Ok(env) => env,
+            Err(err) => {
+                ccx.ecx.set_evm(cached_evm_env);
+                ccx.ecx.set_tx(cached_tx_env);
+                return Err(fmt_err!("transaction execution failed: {err}"));
+            }
+        };
+        let res = res.expect("successful nested execution sets the result");
 
         // Restore env, preserving cheatcode cfg/block changes from the nested EVM
         // but restoring the original tx and basefee (which we zeroed for the nested call)
@@ -1451,11 +1443,6 @@ impl Cheatcode for executeTransactionCall {
         nested_evm_env.cfg_env.tx_gas_limit_cap = cached_evm_env.cfg_env.tx_gas_limit_cap;
         ccx.ecx.set_evm(nested_evm_env);
         ccx.ecx.set_tx(cached_tx_env);
-
-        // Reset inner context flag.
-        executor.set_in_inner_context(false, None);
-
-        let res = res.map_err(|e| fmt_err!("transaction execution failed: {e}"))?;
 
         // Merge state changes back into the parent journaled state.
         merge_child_state(ccx.ecx.journal_mut().evm_state_mut(), res.state, false);

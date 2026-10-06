@@ -28,7 +28,7 @@ use revm::context::{Block, Cfg, ContextTr, JournalTr, Transaction};
 pub use Vm::ForgeContext;
 pub use config::CheatsConfig;
 pub use error::{Error, ErrorKind, Result};
-pub use foundry_evm_core::evm::NestedEvmClosureFor;
+pub use foundry_evm_core::evm::{FreshNestedEvmClosureFor, NestedEvmClosureFor};
 pub use inspector::{
     BroadcastableTransaction, BroadcastableTransactions, Cheatcodes, CheatcodesExecutor,
 };
